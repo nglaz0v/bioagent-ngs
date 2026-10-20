@@ -3,6 +3,7 @@ import anthropic
 import os
 from dotenv import load_dotenv
 from prompts import get_system_prompt
+from rag_engine import get_rag_engine
 
 load_dotenv()
 
@@ -10,17 +11,16 @@ load_dotenv()
 auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
 base_url = os.environ.get("ANTHROPIC_BASE_URL")
 model = os.environ.get("ANTHROPIC_MODEL")
-# api_key = os.environ.get("ANTHROPIC_API_KEY")
-# if not api_key:
-#     st.error("API ключ не найден. Установите переменную окружения ANTHROPIC_API_KEY.")
-#     st.stop()
 
 client = anthropic.Anthropic(auth_token=auth_token, base_url=base_url)
 
 st.set_page_config(page_title="BioAgent NGS/cfDNA", layout="wide")
 st.title("🧬 BioAgent: NGS & cfDNA Assistant")
 
-# Sidebar
+# Инициализация RAG при старте
+rag_engine = get_rag_engine()
+
+# Sidebar с фильтрами RAG
 with st.sidebar:
     st.header("Контекст анализа")
     task_type = st.selectbox("Фокус задачи", [
@@ -29,6 +29,19 @@ with st.sidebar:
         "QC & UMI Deduplication",
         "Pipeline Generation (Snakemake/Nextflow)"
     ])
+
+    st.divider()
+    st.subheader("🔍 RAG Filters")
+    use_rag = st.checkbox("Использовать базу знаний", value=False)
+    
+    if use_rag:
+        category_filter = st.multiselect(
+            "Категории",
+            ["tool_reference", "best_practices", "code_examples", "troubleshooting"],
+            default=["tool_reference", "best_practices"]
+        )
+        top_k = st.slider("Количество источников", 3, 10, 5)
+    
     st.divider()
     if st.button("🗑 Очистить историю"):
         st.session_state.messages = []
@@ -45,25 +58,55 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Chat input
+# Chat input с RAG
 if prompt := st.chat_input("Опишите задачу (например: WES cfDNA, поиск мутаций в TP53...)"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # API Call with Streaming
     with st.chat_message("assistant"):
-        with st.spinner("Анализирую протокол и подбираю инструменты..."):
-            system_prompt = get_system_prompt(task_type)
+        with st.spinner("Ищу в базе знаний и анализирую..."):
+            # RAG Retrieval
+            rag_context = ""
+            sources_used = []
             
-            # Формируем историю для API
+            if use_rag:
+                # Определяем фильтр по утилите, если упоминается в запросе
+                tool_filter = None
+                known_tools = ["gatk", "fgbio", "bwa-mem2", "samtools", "picard", "ichorcna", "lofreq", "sinvict"]
+                for tool in known_tools:
+                    if tool in prompt.lower():
+                        tool_filter = tool
+                        break
+                
+                # Получаем релевантные чанки
+                relevant_chunks = rag_engine.retrieve_relevant_context(
+                    query=prompt,
+                    top_k=top_k,
+                    category_filter=category_filter[0] if len(category_filter) == 1 else None,
+                    tool_filter=tool_filter
+                )
+                
+                # Форматируем контекст
+                if relevant_chunks:
+                    rag_context = "\n\n### РЕЛЕВАНТНАЯ ИНФОРМАЦИЯ ИЗ БАЗЫ ЗНАНИЙ:\n\n"
+                    for i, chunk in enumerate(relevant_chunks, 1):
+                        rag_context += f"**Источник {i}:** {chunk['source']} (категория: {chunk['category']})\n"
+                        rag_context += f"```\n{chunk['content']}\n```\n\n"
+                        sources_used.append(chunk['source'])
+            
+            # Формируем system prompt с RAG контекстом
+            base_system_prompt = get_system_prompt(task_type)
+            full_system_prompt = base_system_prompt + rag_context
+            
+            # API Call
             api_messages = [m for m in st.session_state.messages if m["role"] != "system"]
             
             try:
                 with client.messages.stream(
                     model=model,
                     max_tokens=4096,
-                    system=system_prompt,
+                    system=full_system_prompt,
                     messages=api_messages
                 ) as stream:
                     response_text = ""
@@ -72,8 +115,14 @@ if prompt := st.chat_input("Опишите задачу (например: WES c
                         response_text += text
                         text_placeholder.markdown(response_text + "▌")
                     
-                    text_placeholder.markdown(response_text) # Убираем курсор в конце
+                    text_placeholder.markdown(response_text)
                     
+                    # Показываем использованные источники
+                    if sources_used:
+                        with st.expander("📚 Использованные источники"):
+                            for source in set(sources_used):
+                                st.write(f"- {source}")
+                
                 st.session_state.messages.append({"role": "assistant", "content": response_text})
             except Exception as e:
                 st.error(f"Ошибка API: {e}")
