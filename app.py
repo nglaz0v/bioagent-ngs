@@ -236,7 +236,9 @@ elif mode == "🔍 Code Review":
                     messages=[{"role": "user", "content": review_prompt}]
                 )
                 
-                review_text = response.content[0].text
+                review_text = "".join(block.text for block in response.content if block.type == "text")
+                if review_text == "":
+                    review_text = response.content[0].thinking
                 
                 # Отображаем результат
                 st.markdown("---")
